@@ -1,37 +1,37 @@
 # -*- coding: utf-8 -*-
 # %% [markdown]
 """
-Afet Yönetiminde Kaynak Tahsisi ve Lojistik Optimizasyonu
-=========================================================
+Disaster Response: Resource Allocation and Logistics Optimization
+=================================================================
 
-6 Şubat 2023 Kahramanmaraş depremleri saha gözlemlerinden senaryo tabanlı
-karar destek modeli.
+A scenario-based decision support model built from field observations
+of the 6 February 2023 Kahramanmaraş earthquakes.
 
-İş akışı
+Workflow
 --------
-1. Veri yükleme ve sütun adlarının sadeleştirilmesi
-2. Keşifsel analiz (EDA) ve ilçe bazlı hasar / barınma göstergeleri
-3. Sentetik talep, varsayımsal depolar ve depo–ilçe mesafeleri
-4. Statik çadır tahsisi ve stok duyarlılığı (MILP)
-5. İki aşamalı depo–ilçe sevkiyat modeli: verimlilik ve %70 adalet (MILP)
-6. 72 saatlik araç çizelgeleme simülasyonu: LPT, Equity First, MaxMin
-7. Yerel arama (swap + insertion) ve depolar arası tahsis takası
-8. Nihai planın doğrulanması
-9. Hız duyarlılığı
+1. Data loading and column name simplification
+2. Exploratory data analysis (EDA) and district-level damage / shelter indicators
+3. Synthetic demand, hypothetical depots and depot–district distances
+4. Static tent allocation and stock sensitivity (MILP)
+5. Two-stage depot–district dispatch model: efficiency and 70% equity (MILP)
+6. 72-hour vehicle scheduling simulation: LPT, Equity First, MaxMin
+7. Local search (swap + insertion) and inter-depot allocation swap
+8. Validation of the final plan
+9. Speed sensitivity
 
-Önemli: Talep, depo, stok ve seyahat parametreleri modelleme varsayımıdır.
-Sonuçlar 2023'teki gerçek müdahalenin performansını ölçmez.
+Important: demand, depot, stock and travel parameters are modeling assumptions.
+The results do not measure the performance of the actual 2023 response.
 
-Kullanım
---------
+Usage
+-----
     pip install pandas numpy scipy datasets
-    python afet_lojistigi.py                     # Hugging Face'ten indirir
+    python afet_lojistigi.py                     # downloads from Hugging Face
     python afet_lojistigi.py --csv deprem_gozlem_train.csv
 
-Colab / VS Code'da `# %%` hücreleri ayrı ayrı çalıştırılabilir.
+In Colab / VS Code, the `# %%` cells can be run one by one.
 """
 
-# %% Kütüphaneler
+# %% Libraries
 from __future__ import annotations
 
 import argparse
@@ -48,17 +48,18 @@ pd.set_option("display.width", 160)
 pd.set_option("display.max_columns", 30)
 
 
-# %% 0. Yapılandırma
+# %% 0. Configuration
 @dataclass(frozen=True)
 class Scenario:
-    """Ulaşım senaryosu.
+    """Transport scenario.
 
-    Süre modeli (tüm simülasyonlarda tek ve aynı):
-        τ        = mesafe_km × road_factor / speed_kmh           (tek yön)
-        teslim   = başlangıç + load_hours + τ + unload_hours
-        dönüş    = teslim + τ
-    Rapordaki 72 saatlik sonuçlar load = unload = 0,5 sa (toplam 1 sa sabit
-    operasyon) ile, Bölüm 4.3'teki temel tur süreleri 1 + 1 sa ile üretilmiştir.
+    Travel time model (identical in all simulations):
+        τ        = distance_km × road_factor / speed_kmh           (one way)
+        delivery = start + load_hours + τ + unload_hours
+        return   = delivery + τ
+    The 72-hour results in the report were produced with load = unload = 0.5 h
+    (1 h total fixed operation), while the baseline round-trip times in
+    Section 4.3 were produced with 1 h + 1 h.
     """
     name: str = "Damaged_Roads"
     speed_kmh: float = 25.0
@@ -76,10 +77,10 @@ class Config:
     )
     seed: int = 42
     demand_low: int = 100
-    demand_high: int = 500            # dahil
-    tent_capacity: int = 4            # kişi / çadır
-    truck_capacity: int = 50          # çadır / sefer
-    min_coverage: float = 0.70        # adalet eşiği
+    demand_high: int = 500            # inclusive
+    tent_capacity: int = 4            # people / tent
+    truck_capacity: int = 50          # tents / trip
+    min_coverage: float = 0.70        # equity threshold
     horizons: tuple = (24, 48, 72)
     stock_levels: tuple = (500, 750, 1000, 1250, 1500, 2000)
     local_search_iters: int = 3000
@@ -101,7 +102,7 @@ def section(title: str) -> None:
     print(f"\n{'=' * 78}\n{title}\n{'=' * 78}")
 
 
-# %% 1. Veri yükleme ve temizleme
+# %% 1. Data loading and cleaning
 RENAME_MAP = {
     "start": "survey_start",
     "end": "survey_end",
@@ -191,12 +192,12 @@ ANALYSIS_COLUMNS = [
 
 
 def load_raw(csv_path: str | None = None, cfg: Config = CFG) -> pd.DataFrame:
-    """Train bölümünü yükler. CSV verilirse onu, yoksa Hugging Face'i kullanır."""
+    """Loads the train split. Uses the CSV if given, otherwise Hugging Face."""
     if csv_path:
         return pd.read_csv(csv_path)
-    from datasets import load_dataset  # yalnızca gerektiğinde içe aktar
+    from datasets import load_dataset  # import only when needed
     ds = load_dataset(cfg.dataset_id, verification_mode="no_checks")
-    for split in ds:                     # yerel kopya (tekrarlanabilirlik)
+    for split in ds:                     # local copy (reproducibility)
         ds[split].to_pandas().to_csv(f"deprem_gozlem_{split}.csv", index=False)
     return ds["train"].to_pandas()
 
@@ -209,13 +210,13 @@ def _clean_column_name(col: str) -> str:
 
 
 def clean_data(raw: pd.DataFrame) -> pd.DataFrame:
-    """Sütunları okunur hale getirir, kategorileri kısaltır, bayrak üretir."""
+    """Makes columns readable, shortens categories and creates flags."""
     df = raw.rename(columns=RENAME_MAP)
     df = df.rename(columns={c: _clean_column_name(c) for c in df.columns})
 
     dup = df.columns[df.columns.duplicated()].tolist()
     if dup:
-        raise ValueError(f"Aynı ada dönüşen sütunlar: {dup}")
+        raise ValueError(f"Columns mapped to the same name: {dup}")
 
     df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
     df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
@@ -234,7 +235,7 @@ def clean_data(raw: pd.DataFrame) -> pd.DataFrame:
         df[flag] = shelter.str.contains(rf"\b{token}\b", regex=True)
     df["has_afad_tent"] = df["afad_tent"] == 1
 
-    # Konut hasarı eksikse NaN kalır (oranlarda paydaya girmez)
+    # Missing housing damage stays NaN (excluded from the rate denominators)
     df["critical_damage"] = np.where(
         df["housing_damage"].isna(), np.nan,
         df["housing_damage"].isin(CRITICAL_DAMAGE).astype(float))
@@ -243,13 +244,13 @@ def clean_data(raw: pd.DataFrame) -> pd.DataFrame:
         "has_container", "has_afad_tent", "critical_damage"]].copy()
 
 
-# %% 2. Keşifsel analiz
+# %% 2. Exploratory analysis
 def run_eda(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    section("2. KEŞİFSEL ANALİZ")
-    print(f"Kayıt: {len(df)} · İl: {df['province'].nunique()} · "
-          f"İlçe: {df['district'].nunique()}")
+    section("2. EXPLORATORY ANALYSIS")
+    print(f"Records: {len(df)} · Provinces: {df['province'].nunique()} · "
+          f"Districts: {df['district'].nunique()}")
 
-    print("\nEksik veri oranı (%):")
+    print("\nMissing data rate (%):")
     print(df[ANALYSIS_COLUMNS].isna().mean().mul(100).round(1)
           .sort_values(ascending=False).to_string())
 
@@ -258,22 +259,22 @@ def run_eda(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         print(f"\n--- {col} ---")
         print(df[col].value_counts(dropna=False).to_string())
 
-    print("\nBarınma türü gözlem sayıları:")
+    print("\nShelter type observation counts:")
     print(df[["has_makeshift", "has_emergency_tent", "has_private_tent",
               "has_container", "has_afad_tent"]].sum().to_string())
 
-    print("\nAğır hasar × derme çatma barınak × yardım almama:")
+    print("\nCritical damage × makeshift shelter × no assistance received:")
     print(pd.crosstab([df["critical_damage"], df["has_makeshift"]],
                       df["no_shelter_assistance"], dropna=False))
 
     critical_without_tent = df[(df["critical_damage"] == 1) & (df["afad_tent"] == 0)]
-    print(f"\nAğır hasar + AFAD çadırı gözlenmeyen kayıt: {len(critical_without_tent)}")
+    print(f"\nCritical damage + no AFAD tent observed records: {len(critical_without_tent)}")
     print(critical_without_tent[["province", "district", "housing_damage",
                                  "shelter_type", "no_shelter_assistance",
                                  "idps_estimated"]].to_string(index=False))
 
     indicators = district_indicators(df)
-    print("\nİlçe bazlı göstergeler (veri yeterliliği ile):")
+    print("\nDistrict-level indicators (with data sufficiency):")
     print(indicators.sort_values(["observations", "critical_rate"],
                                  ascending=False).round(2).to_string(index=False))
     return {"indicators": indicators,
@@ -299,9 +300,9 @@ def district_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return g
 
 
-# %% 3. Sentetik talep, depolar ve mesafeler
+# %% 3. Synthetic demand, depots and distances
 def haversine(lat1, lon1, lat2, lon2):
-    """Kuş uçuşu mesafe (km)."""
+    """Great-circle distance (km)."""
     r = 6371.0
     p1, p2 = np.radians(lat1), np.radians(lat2)
     dp, dl = np.radians(lat2 - lat1), np.radians(lon2 - lon1)
@@ -310,12 +311,12 @@ def haversine(lat1, lon1, lat2, lon2):
 
 
 def build_network(df: pd.DataFrame, indicators: pd.DataFrame, cfg: Config = CFG):
-    """İlçe talebi (sentetik) ve depo–ilçe rota tablosunu üretir.
+    """Generates (synthetic) district demand and the depot–district route table.
 
-    Talep, 23 ilçelik tabloda üretilir (orijinal çalışmayla aynı RNG sırası);
-    koordinatı olmayan ilçeler ardından elenir.
+    Demand is generated on the 23-district table (same RNG order as the
+    original study); districts without coordinates are dropped afterwards.
     """
-    section("3. SENTETİK SENARYO VE AĞ")
+    section("3. SYNTHETIC SCENARIO AND NETWORK")
     rng = np.random.default_rng(cfg.seed)
     all_districts = indicators[["province", "district"]].copy()
     all_districts["demand"] = rng.integers(
@@ -327,7 +328,7 @@ def build_network(df: pd.DataFrame, indicators: pd.DataFrame, cfg: Config = CFG)
                    .reset_index()
                    .dropna(subset=["latitude", "longitude"]))
     missing = set(all_districts["district"]) - set(locations["district"])
-    print(f"Koordinatı olmayan ilçeler (modelden çıkarıldı): {sorted(missing)}")
+    print(f"Districts without coordinates (removed from model): {sorted(missing)}")
 
     districts = (all_districts
                  .merge(locations[["province", "district"]],
@@ -344,16 +345,16 @@ def build_network(df: pd.DataFrame, indicators: pd.DataFrame, cfg: Config = CFG)
                      validate="many_to_one")
               .reset_index(drop=True))
 
-    print(f"İlçe: {len(districts)} · Depo: {len(cfg.depots)} · "
-          f"Rota: {len(routes)} · Talep: {districts['demand'].sum():,} kişi · "
-          f"Stok: {cfg.depots['stock'].sum():,} çadır")
+    print(f"Districts: {len(districts)} · Depots: {len(cfg.depots)} · "
+          f"Routes: {len(routes)} · Demand: {districts['demand'].sum():,} people · "
+          f"Stock: {cfg.depots['stock'].sum():,} tents")
     return all_districts, districts, routes
 
 
-# %% 4. Statik tahsis ve stok duyarlılığı
+# %% 4. Static allocation and stock sensitivity
 def solve_static_allocation(demand: np.ndarray, total_tents: int,
                             cap: int = CFG.tent_capacity) -> dict:
-    """min Σu  s.t. cap·x + u ≥ d,  Σx ≤ S,  0 ≤ x ≤ ⌈d/cap⌉ (tam sayı)."""
+    """min Σu  s.t. cap·x + u ≥ d,  Σx ≤ S,  0 ≤ x ≤ ⌈d/cap⌉ (integer)."""
     n = len(demand)
     c = np.concatenate([np.zeros(n), np.ones(n)])
     a = np.vstack([np.hstack([cap * np.eye(n), np.eye(n)]),
@@ -374,24 +375,24 @@ def solve_static_allocation(demand: np.ndarray, total_tents: int,
 
 
 def stock_sensitivity(all_districts: pd.DataFrame, cfg: Config = CFG) -> pd.DataFrame:
-    section("4. STATİK TAHSİS — STOK DUYARLILIĞI")
+    section("4. STATIC ALLOCATION — STOCK SENSITIVITY")
     demand = all_districts["demand"].to_numpy()
     out = pd.DataFrame([solve_static_allocation(demand, s) for s in cfg.stock_levels])
     print(out.to_string(index=False))
-    print(f"Kapasiteye dayalı alt sınır: {int(np.ceil(demand.sum() / cfg.tent_capacity))} çadır · "
-          f"İlçe bazında tam sayı gereksinim: "
-          f"{int(np.ceil(demand / cfg.tent_capacity).sum())} çadır")
+    print(f"Capacity-based lower bound: {int(np.ceil(demand.sum() / cfg.tent_capacity))} tents · "
+          f"District-level integer requirement: "
+          f"{int(np.ceil(demand / cfg.tent_capacity).sum())} tents")
     return out
 
 
-# %% 5. İki aşamalı depo–ilçe MILP (verimlilik ve adalet)
+# %% 5. Two-stage depot–district MILP (efficiency and equity)
 def solve_depot_allocation(districts: pd.DataFrame, routes: pd.DataFrame,
                            min_coverage: float | None = None,
                            cfg: Config = CFG) -> pd.DataFrame:
-    """Aşama 1: Σu en aza; Aşama 2: Σu ≤ U* tutularak Σ c·x (çadır-km) en aza.
+    """Stage 1: minimize Σu; Stage 2: keep Σu ≤ U*, minimize Σ c·x (tent-km).
 
-    min_coverage verilirse her ilçe için u_j ≤ (1-α)·d_j eklenir.
-    Dönüş: routes + allocated_tents sütunu.
+    If min_coverage is given, u_j ≤ (1-α)·d_j is added for each district.
+    Returns: routes + allocated_tents column.
     """
     nr, nd = len(routes), len(districts)
     d = districts["demand"].to_numpy()
@@ -420,7 +421,7 @@ def solve_depot_allocation(districts: pd.DataFrame, routes: pd.DataFrame,
     stage1 = milp(np.r_[np.zeros(nr), np.ones(nd)], integrality=integrality,
                   bounds=bounds, constraints=cons)
     if not stage1.success:
-        raise RuntimeError(f"Aşama 1: {stage1.message}")
+        raise RuntimeError(f"Stage 1: {stage1.message}")
 
     a_unmet = np.r_[np.zeros(nr), np.ones(nd)].reshape(1, -1)
     stage2 = milp(np.r_[routes["distance_km"].to_numpy(), np.zeros(nd)],
@@ -428,7 +429,7 @@ def solve_depot_allocation(districts: pd.DataFrame, routes: pd.DataFrame,
                   constraints=cons + [LinearConstraint(a_unmet, -np.inf,
                                                        stage1.fun + 1e-6)])
     if not stage2.success:
-        raise RuntimeError(f"Aşama 2: {stage2.message}")
+        raise RuntimeError(f"Stage 2: {stage2.message}")
 
     out = routes.copy()
     out["allocated_tents"] = np.rint(stage2.x[:nr]).astype(int)
@@ -451,19 +452,19 @@ def allocation_summary(alloc: pd.DataFrame, districts: pd.DataFrame,
 
 
 def compare_efficiency_equity(districts, routes, cfg: Config = CFG):
-    section("5. DEPO–İLÇE SEVKİYATI: VERİMLİLİK vs ADALET")
+    section("5. DEPOT–DISTRICT DISPATCH: EFFICIENCY vs EQUITY")
     eff = solve_depot_allocation(districts, routes, None, cfg)
     eq = solve_depot_allocation(districts, routes, cfg.min_coverage, cfg)
-    table = pd.DataFrame({"Verimlilik": allocation_summary(eff, districts, cfg),
-                          "Adalet (≥%70)": allocation_summary(eq, districts, cfg)})
+    table = pd.DataFrame({"Efficiency": allocation_summary(eff, districts, cfg),
+                          "Equity (≥70%)": allocation_summary(eq, districts, cfg)})
     print(table.to_string())
     d_km = table.loc["tent_km"]
-    print(f"Adaletin ek taşıma yükü: {d_km.iloc[1] - d_km.iloc[0]:,.2f} çadır-km "
-          f"(%{100 * (d_km.iloc[1] / d_km.iloc[0] - 1):.2f})")
+    print(f"Extra transport load of equity: {d_km.iloc[1] - d_km.iloc[0]:,.2f} tent-km "
+          f"({100 * (d_km.iloc[1] / d_km.iloc[0] - 1):.2f}%)")
     return eff, eq, table
 
 
-# %% 6. Süre modeli ve çizelgeleme
+# %% 6. Travel time model and scheduling
 def with_travel_times(alloc: pd.DataFrame, sc: Scenario) -> pd.DataFrame:
     out = alloc.copy()
     out["estimated_road_km"] = out["distance_km"] * sc.road_factor
@@ -474,7 +475,7 @@ def with_travel_times(alloc: pd.DataFrame, sc: Scenario) -> pd.DataFrame:
 
 
 def split_into_trips(alloc: pd.DataFrame, cfg: Config = CFG) -> pd.DataFrame:
-    """Her rotanın tahsisini ≤ truck_capacity çadırlık seferlere böler."""
+    """Splits each route's allocation into trips of ≤ truck_capacity tents."""
     rows = []
     for _, r in alloc.iterrows():
         remaining, trip_no = int(r["allocated_tents"]), 0
@@ -494,13 +495,13 @@ def order_trips(trips: pd.DataFrame, strategy: str) -> pd.DataFrame:
         return trips.sort_values("travel_hours", ascending=False)
     if strategy == "Equity_First":
         return trips.sort_values(["trip_no", "travel_hours"], ascending=[True, True])
-    raise ValueError(f"Bilinmeyen strateji: {strategy}")
+    raise ValueError(f"Unknown strategy: {strategy}")
 
 
 def dispatch(trips: pd.DataFrame, sc: Scenario, sort_depots: bool = True) -> pd.DataFrame:
-    """Sıralı sefer listesini, her depoda ilk boşalan araca atar.
+    """Assigns the ordered trip list to the first available truck at each depot.
 
-    trips sırası korunur; her satırda travel_hours bulunmalıdır.
+    The order of trips is preserved; each row must contain travel_hours.
     """
     results = []
     for depot, group in trips.groupby("depot", sort=sort_depots):
@@ -522,14 +523,15 @@ def dispatch(trips: pd.DataFrame, sc: Scenario, sort_depots: bool = True) -> pd.
 
 def simulate(alloc: pd.DataFrame, sc: Scenario, strategy: str,
              cfg: Config = CFG) -> pd.DataFrame:
-    """LPT veya Equity_First kuralıyla 72 saatlik teslimat çizelgesi."""
+    """72-hour delivery schedule under the LPT or Equity_First rule."""
     trips = split_into_trips(with_travel_times(alloc, sc), cfg)
     return dispatch(order_trips(trips, strategy), sc)
 
 
 def simulate_maxmin(alloc: pd.DataFrame, districts: pd.DataFrame, sc: Scenario,
                     cfg: Config = CFG) -> pd.DataFrame:
-    """Boşalan araç, kendi deposundan o an planlanan hizmeti en düşük ilçeye gider."""
+    """When a truck becomes free, it goes from its own depot to the district
+    with the lowest currently planned service."""
     df = with_travel_times(alloc, sc)
     demand = {(r.province, r.district): r.demand for r in districts.itertuples()}
     remaining = {i: int(r["allocated_tents"]) for i, r in df.iterrows()}
@@ -549,7 +551,7 @@ def simulate_maxmin(alloc: pd.DataFrame, districts: pd.DataFrame, sc: Scenario,
             cov = min(1.0, cfg.tent_capacity * planned[key] / demand[key])
             candidates.append((cov, r["travel_hours"], i,
                                min(cfg.truck_capacity, remaining[i]), key))
-        if not candidates:          # bu deponun işi bitti; araç havuza dönmez
+        if not candidates:          # this depot is done; the truck does not return to the pool
             continue
         _, tau, i, load, key = min(candidates)
         delivery = start + sc.load_hours + tau + sc.unload_hours
@@ -565,7 +567,7 @@ def simulate_maxmin(alloc: pd.DataFrame, districts: pd.DataFrame, sc: Scenario,
     return pd.DataFrame(results)
 
 
-# %% 7. Hizmet ölçüleri
+# %% 7. Service metrics
 def district_coverage(schedule: pd.DataFrame, districts: pd.DataFrame,
                       hour: float, cfg: Config = CFG) -> pd.DataFrame:
     delivered = (schedule.loc[schedule["delivery_hour"] <= hour]
@@ -581,8 +583,8 @@ def district_coverage(schedule: pd.DataFrame, districts: pd.DataFrame,
 
 def score(schedule: pd.DataFrame, districts: pd.DataFrame,
           horizon: float = 72, cfg: Config = CFG) -> tuple:
-    """Leksikografik skor (küçük iyi):
-    (eşik altı ilçe, eşik için eksik çadır, −min hizmet %, −toplam hizmet)."""
+    """Lexicographic score (lower is better):
+    (districts below threshold, missing tents for threshold, −min service %, −total service)."""
     cov = district_coverage(schedule, districts, horizon, cfg)
     required = np.ceil(cfg.min_coverage * cov["demand"] / cfg.tent_capacity)
     shortage = np.maximum(0, required - cov["delivered_tents"]).sum()
@@ -609,7 +611,7 @@ def horizon_table(schedules: dict, districts: pd.DataFrame,
 
 def time_to_target(schedule: pd.DataFrame, districts: pd.DataFrame,
                    cfg: Config = CFG) -> pd.DataFrame:
-    """İlk teslimat saati ve %70 hedefine ulaşma saati (T70)."""
+    """First delivery time and the time to reach the 70% target (T70)."""
     rows = []
     for r in districts.itertuples():
         s = (schedule[(schedule["province"] == r.province)
@@ -625,11 +627,11 @@ def time_to_target(schedule: pd.DataFrame, districts: pd.DataFrame,
     return out
 
 
-# %% 8. Yerel arama ve depo takası
+# %% 8. Local search and depot swap
 def local_search(trips: pd.DataFrame, districts: pd.DataFrame, sc: Scenario,
                  iterations: int, seed: int, cfg: Config = CFG):
-    """Aynı depodaki iki seferin yerini değiştir (swap) ya da birini başka
-    sıraya taşı (insertion); yalnızca skoru iyileştiren hamleyi kabul et."""
+    """Swap the positions of two trips in the same depot, or move one to another
+    position (insertion); accept only the moves that improve the score."""
     trips = trips.reset_index(drop=True)
     best_sched = dispatch(trips, sc, sort_depots=False)
     best = score(best_sched, districts, cfg=cfg)
@@ -660,7 +662,7 @@ def local_search(trips: pd.DataFrame, districts: pd.DataFrame, sc: Scenario,
 def optimize_schedule(alloc: pd.DataFrame, districts: pd.DataFrame, sc: Scenario,
                       seed: int = CFG.seed, iterations: int = CFG.local_search_iters,
                       cfg: Config = CFG) -> dict:
-    """Equity First başlangıcından yerel arama."""
+    """Local search starting from the Equity_First schedule."""
     initial = simulate(alloc, sc, "Equity_First", cfg)
     trips = (initial.sort_values(["depot", "start_hour", "truck_id"])
              .reset_index(drop=True)[["depot", "province", "district", "tents",
@@ -674,16 +676,16 @@ def swap_allocation(alloc: pd.DataFrame, receiver: str = "Besni",
                     partner: str | None = None, transfer: int = 18,
                     near_depot: str = "Adiyaman_Depot",
                     far_depot: str = "Hatay_Depot") -> pd.DataFrame:
-    """receiver ilçesinin `transfer` çadırını uzak depodan yakın depoya alır;
-    karşılığında partner ilçesinin aynı miktarını yakın depodan uzak depoya verir.
-    Depo stokları ve ilçe toplamları değişmez."""
+    """Moves `transfer` tents of the receiver district from the far depot to the
+    near depot; in exchange, the partner district gives the same amount from the
+    near depot to the far depot. Depot stocks and district totals do not change."""
     out = alloc.copy()
     if partner is None:
         return out
 
     def idx(depot, district):
         m = out.index[(out["depot"] == depot) & (out["district"] == district)]
-        assert len(m) == 1, f"Tekil rota yok: {depot} → {district}"
+        assert len(m) == 1, f"No unique route: {depot} → {district}"
         return m[0]
 
     for depot, district, delta in [(near_depot, receiver, +transfer),
@@ -692,7 +694,7 @@ def swap_allocation(alloc: pd.DataFrame, receiver: str = "Besni",
                                    (far_depot, partner, +transfer)]:
         out.loc[idx(depot, district), "allocated_tents"] += delta
 
-    assert (out["allocated_tents"] >= 0).all(), "Negatif tahsis oluştu"
+    assert (out["allocated_tents"] >= 0).all(), "Negative allocation occurred"
     assert out.groupby("depot")["allocated_tents"].sum().equals(
         alloc.groupby("depot")["allocated_tents"].sum())
     assert out.groupby(["province", "district"])["allocated_tents"].sum().equals(
@@ -702,20 +704,21 @@ def swap_allocation(alloc: pd.DataFrame, receiver: str = "Besni",
 
 def swap_candidates(alloc: pd.DataFrame, receiver="Besni", transfer=18,
                     near_depot="Adiyaman_Depot", far_depot="Hatay_Depot") -> list:
-    """Yakın depodan en az `transfer` çadır alan ve uzak depodan da rotası olan ilçeler."""
+    """Districts that receive at least `transfer` tents from the near depot and
+    also have a route from the far depot."""
     near = alloc[(alloc["depot"] == near_depot) & (alloc["district"] != receiver)
                  & (alloc["allocated_tents"] >= transfer)]
     far = set(alloc.loc[alloc["depot"] == far_depot, "district"])
     return [d for d in near["district"] if d in far]
 
 
-# %% 9. Doğrulama
+# %% 9. Validation
 def validate_plan(alloc: pd.DataFrame, schedule: pd.DataFrame,
                   districts: pd.DataFrame, sc: Scenario, cfg: Config = CFG) -> pd.DataFrame:
     checks = []
     stock = alloc.groupby("depot")["allocated_tents"].sum()
     limits = cfg.depots.set_index("depot")["stock"]
-    checks.append(("Depo stoku", bool((stock <= limits.reindex(stock.index)).all()),
+    checks.append(("Depot stock", bool((stock <= limits.reindex(stock.index)).all()),
                    " · ".join(f"{k.split('_')[0]} {v}" for k, v in stock.items())))
 
     overlaps = 0
@@ -723,34 +726,34 @@ def validate_plan(alloc: pd.DataFrame, schedule: pd.DataFrame,
         g = g.sort_values("start_hour")
         overlaps += int((g["start_hour"].to_numpy()[1:]
                          < g["return_hour"].to_numpy()[:-1] - 1e-8).sum())
-    checks.append(("Araç çakışması", overlaps == 0, f"{overlaps} çakışma"))
+    checks.append(("Vehicle overlap", overlaps == 0, f"{overlaps} conflicts"))
 
     planned = alloc.groupby(["depot", "province", "district"])["allocated_tents"].sum()
     sched = schedule.groupby(["depot", "province", "district"])["tents"].sum()
     diff = pd.concat([planned, sched], axis=1).fillna(0).diff(axis=1).iloc[:, 1].abs().max()
-    checks.append(("Tahsis korunumu", diff == 0, f"maks. fark {diff:.0f}"))
+    checks.append(("Allocation conservation", diff == 0, f"max diff {diff:.0f}"))
 
     trucks = schedule.groupby("depot")["truck_id"].nunique()
-    checks.append(("Filo sınırı", bool((trucks <= sc.trucks_per_depot).all()),
-                   f"maks. {trucks.max()} araç/depo"))
-    checks.append(("Sefer yükü", bool(schedule["tents"].between(1, cfg.truck_capacity).all()),
-                   f"{schedule['tents'].min()}–{schedule['tents'].max()} çadır"))
+    checks.append(("Fleet limit", bool((trucks <= sc.trucks_per_depot).all()),
+                   f"max {trucks.max()} vehicles/depot"))
+    checks.append(("Trip load", bool(schedule["tents"].between(1, cfg.truck_capacity).all()),
+                   f"{schedule['tents'].min()}–{schedule['tents'].max()} tents"))
 
     cov = district_coverage(schedule, districts, 72, cfg)
     ok = int((cov["coverage_pct"] >= 100 * cfg.min_coverage - 1e-8).sum())
-    checks.append(("72 saatlik adalet", ok == len(cov), f"{ok}/{len(cov)} ilçe ≥ %70"))
+    checks.append(("72-hour equity", ok == len(cov), f"{ok}/{len(cov)} districts ≥ 70%"))
     total = 100 * cov["served"].sum() / cov["demand"].sum()
     worst = cov.loc[cov["coverage_pct"].idxmin()]
-    checks.append(("Toplam hizmet", True,
-                   f"{cov['served'].sum():,} / {cov['demand'].sum():,} kişi (%{total:.2f}); "
-                   f"en düşük {worst['district']} %{worst['coverage_pct']:.2f}"))
-    return pd.DataFrame(checks, columns=["kontrol", "geçti", "sonuç"])
+    checks.append(("Total service", True,
+                   f"{cov['served'].sum():,} / {cov['demand'].sum():,} people ({total:.2f}%); "
+                   f"lowest {worst['district']} {worst['coverage_pct']:.2f}%"))
+    return pd.DataFrame(checks, columns=["check", "passed", "result"])
 
 
-# %% 10. Hız duyarlılığı
+# %% 10. Speed sensitivity
 def speed_sensitivity(trips: pd.DataFrame, districts: pd.DataFrame, base: Scenario,
                       speeds=(15, 20, 25, 30, 35, 40), cfg: Config = CFG) -> pd.DataFrame:
-    """Görev sırası sabit, seyahat süreleri yeni hızla yeniden hesaplanır."""
+    """Task order is kept fixed; travel times are recomputed with the new speed."""
     rows = []
     for v in speeds:
         t = trips.copy()
@@ -764,27 +767,27 @@ def speed_sensitivity(trips: pd.DataFrame, districts: pd.DataFrame, base: Scenar
     return pd.DataFrame(rows)
 
 
-# %% 11. Ana akış
+# %% 11. Main flow
 def main(csv_path: str | None = None, cfg: Config = CFG) -> dict:
-    section("1. VERİ")
+    section("1. DATA")
     df = clean_data(load_raw(csv_path, cfg))
     eda = run_eda(df)
     all_districts, districts, routes = build_network(df, eda["indicators"], cfg)
     stock_table = stock_sensitivity(all_districts, cfg)
     eff, eq, eff_eq_table = compare_efficiency_equity(districts, routes, cfg)
 
-    # Temel senaryo tur süreleri (Bölüm 4.3)
+    # Baseline scenario round times (Section 4.3)
     base_times = with_travel_times(eq, cfg.baseline)
     base_times["required_trips"] = np.ceil(base_times["allocated_tents"]
                                            / cfg.truck_capacity).astype(int)
-    print("\nTemel senaryo — en uzun turlar:")
+    print("\nBaseline scenario — longest trips:")
     print(base_times.loc[base_times["allocated_tents"] > 0,
                          ["depot", "district", "allocated_tents", "estimated_road_km",
                           "round_trip_hours", "required_trips"]]
           .sort_values("round_trip_hours", ascending=False).head(10)
           .round(2).to_string(index=False))
 
-    section("6. 72 SAATLİK ÇİZELGELEME — AĞIR YOL HASARI")
+    section("6. 72-HOUR SCHEDULING — SEVERE ROAD DAMAGE")
     sc = cfg.damaged
     schedules = {"LPT": simulate(eq, sc, "LPT", cfg),
                  "Equity_First": simulate(eq, sc, "Equity_First", cfg),
@@ -792,18 +795,18 @@ def main(csv_path: str | None = None, cfg: Config = CFG) -> dict:
     print(horizon_table(schedules, districts, cfg).to_string(index=False))
     for name, sch in schedules.items():
         t70 = time_to_target(sch, districts, cfg)
-        print(f"{name:13s} 72 saatte %70'e ulaşan: {int(t70['T70_within_72h'].sum())}/{len(t70)}"
-              f" · ilk teslimat medyanı: {t70['first_delivery_hour'].median():.2f} sa")
+        print(f"{name:13s} reaching 70% within 72 h: {int(t70['T70_within_72h'].sum())}/{len(t70)}"
+              f" · median first delivery: {t70['first_delivery_hour'].median():.2f} h")
 
-    section("7. YEREL ARAMA VE DEPO TAKASI")
+    section("7. LOCAL SEARCH AND DEPOT SWAP")
     variants = {"Original": None}
     variants.update({d: d for d in swap_candidates(eq)})
     results, models = [], {}
     for name, partner in variants.items():
         try:
             alloc = swap_allocation(eq, partner=partner)
-        except AssertionError as err:        # uygulanamaz takas → atla
-            print(f"{name}: takas atlandı ({err})")
+        except AssertionError as err:        # infeasible swap → skip
+            print(f"{name}: swap skipped ({err})")
             continue
         res = optimize_schedule(alloc, districts, sc, cfg=cfg)
         res["allocation"] = alloc
@@ -817,31 +820,31 @@ def main(csv_path: str | None = None, cfg: Config = CFG) -> dict:
     print(comparison.to_string(index=False))
     best_name = comparison.iloc[0]["model"]
     best = models[best_name]
-    print(f"\nSeçilen plan: {best_name}")
+    print(f"\nSelected plan: {best_name}")
 
     late = best["schedule"][best["schedule"]["delivery_hour"] > 72]
     if len(late):
-        print("\n72 saatten sonra ulaşan seferler:")
+        print("\nTrips arriving after 72 hours:")
         print(late[["depot", "district", "tents", "delivery_hour"]]
               .round(2).to_string(index=False))
 
-    section("8. NİHAİ PLANIN DOĞRULANMASI")
+    section("8. VALIDATION OF THE FINAL PLAN")
     validation = validate_plan(best["allocation"], best["schedule"], districts, sc, cfg)
     print(validation.to_string(index=False))
     final_cov = district_coverage(best["schedule"], districts, 72, cfg)
-    print("\nİlçe bazında 72 saatlik hizmet:")
+    print("\nDistrict-level 72-hour service:")
     print(final_cov[["district", "demand", "delivered_tents", "coverage_pct"]]
           .sort_values("coverage_pct").round(2).to_string(index=False))
 
-    section("9. HIZ DUYARLILIĞI")
+    section("9. SPEED SENSITIVITY")
     speed = speed_sensitivity(best["trips"], districts, sc, cfg=cfg)
-    print("Sabit görev sırası:")
+    print("Fixed task order:")
     print(speed.to_string(index=False))
     slow = replace(sc, speed_kmh=20)
     reopt = optimize_schedule(best["allocation"], districts, slow,
                               seed=2026, iterations=5000, cfg=cfg)
-    print(f"\n20 km/sa yeniden çizelgeleme: başlangıç {reopt['initial_score']} "
-          f"→ sonuç {reopt['score']}  (eşik altı, eksik çadır, −min %, −hizmet)")
+    print(f"\nRescheduling at 20 km/h: start {reopt['initial_score']} "
+          f"→ result {reopt['score']}  (below threshold, missing tents, −min %, −service)")
 
     return {"data": df, "districts": districts, "routes": routes,
             "stock_table": stock_table, "efficiency_vs_equity": eff_eq_table,
@@ -853,6 +856,6 @@ def main(csv_path: str | None = None, cfg: Config = CFG) -> dict:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    parser.add_argument("--csv", help="Yerel train CSV yolu (deprem_gozlem_train.csv)")
-    args, _ = parser.parse_known_args()   # Colab/Jupyter argümanlarını yok say
+    parser.add_argument("--csv", help="Path to local train CSV (deprem_gozlem_train.csv)")
+    args, _ = parser.parse_known_args()   # ignore Colab/Jupyter arguments
     results = main(args.csv)
