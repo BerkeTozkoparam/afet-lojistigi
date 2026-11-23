@@ -104,3 +104,14 @@ on Hugging Face. The raw dataset is not included in this repository.
   the raw dataset exactly.
 - The equity MILP and the local search use `scipy.optimize.milp`, which
   requires SciPy 1.9 or newer.
+!!!!!Copyright and Usage Permissions
+
+Copyright © 2026 Berke Baran Tozkoparan. All rights reserved.
+
+  No open-source license is granted for this repository.
+
+  The original source code and documentation are subject to applicable copyright protections. Public access does not grant general permission for copying, modification or redistribution.
+
+  The public dataset, underlying facts and general mathematical methods are not claimed as exclusively owned.
+
+  Permission requests should be directed to the repository owner.
